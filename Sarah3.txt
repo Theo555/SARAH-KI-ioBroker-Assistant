@@ -1,0 +1,556 @@
+/**
+ * S.A.R.A.H. - Smart Home KI-Assistentin für ioBroker
+ * Inspiriert durch die KI aus der Serie Eureka
+ *  
+ * Beschreibung:
+ * Dieses Skript verbindet den ioBroker (via Telegram und MQTT) mit der DeepSeek-KI 
+ * und externen APIs (Open-Meteo für Wetter, Serper.dev für Websuche).
+ * Durch intelligente Kontext- und Prefix-Cache-Optimierung werden API-Tokenkosten minimiert, 
+ * ohne die Performance oder Benutzererfahrung zu beeinträchtigen.
+ *
+ * Hauptfunktionen:
+ * - Sprach- und Textverarbeitung über Telegram-Trigger mit personalisierten Prompts.
+ * - Intelligente Hardware-Steuerung von Tasmota-Geräten und Gruppen über lokalen MQTT-Broker.
+ * - Sensor-Abfragen (Wetter, Anwesenheit, Balkonkraftwerk, Lampenstatus) via Tool-Calling.
+ * - Integrierte Websuche ("Max") mit vorheriger Benutzerbestätigung.
+ */
+
+const axios = require('axios');
+
+// === 1. DATENPUNKTE AUTOMATISCH ANLEGEN ===
+createState('0_userdata.0.SARAH.Haushalt.Mitglieder', 'Person A (Bewohner), Person B (Bewohner)', { 
+    name: 'Haushaltsmitglieder und Rollen', 
+    type: 'string', 
+    role: 'text', 
+    read: true, 
+    write: true,
+    desc: 'Trage hier die Namen und Rollen der Haushaltsmitglieder für den KI-Prompt ein.' 
+});
+createState('0_userdata.0.Wetter.Koordinaten', '52.52,13.405', { 
+    name: 'Wetter Koordinaten (Lat,Lon)', 
+    type: 'string', 
+    role: 'text', 
+    read: true, 
+    write: true,
+    desc: 'Trage hier deine Koordinaten ein (Standard: Berlin). Format: Breitengrad,Längengrad' 
+});
+createState('0_userdata.0.Wetter.Ortsname', 'Berlin', { 
+    name: 'Wetter Ortsname (automatisch ermittelt)', 
+    type: 'string', 
+    role: 'text', 
+    read: true, 
+    write: true,
+    desc: 'Wird automatisch anhand der Koordinaten ermittelt' 
+});
+createState('0_userdata.0.Wetter.Temperatur', 0, { name: 'Temperatur', type: 'number', unit: '°C' });
+createState('0_userdata.0.Wetter.Feuchtigkeit', 0, { name: 'Feuchtigkeit', type: 'number', unit: '%' });
+createState('0_userdata.0.Wetter.Niederschlag', 0, { name: 'Niederschlag', type: 'number', unit: 'mm' });
+createState('0_userdata.0.Wetter.Windgeschwindigkeit', 0, { name: 'Windgeschwindigkeit', type: 'number', unit: 'km/h' });
+createState('0_userdata.0.Wetter.Windrichtung', 0, { name: 'Windrichtung', type: 'number', unit: '°' });
+
+createState('0_userdata.0.DeepseekAPI', '', { 
+    name: 'DeepSeek API Key', 
+    type: 'string', 
+    role: 'text', 
+    read: true, 
+    write: true,
+    desc: 'Trage im ioBroker-Datenpunkt deinen persönlichen DeepSeek API-Key ein' 
+});
+
+createState('0_userdata.0.SerperAPI', '', { 
+    name: 'Serper.dev API Key (Websuche)', 
+    type: 'string', 
+    role: 'text', 
+    read: true, 
+    write: true,
+    desc: 'Trage hier deinen kostenlosen Serper.dev API-Key ein' 
+});
+
+const USER_DATENPUNKTE = [
+    '0_userdata.0.Telegramm_User_1',
+    '0_userdata.0.Telegramm_User_2'
+];
+
+USER_DATENPUNKTE.forEach((dpPfad, index) => {
+    let zugewiesenerPrompt = (index === 0) ? 'benutzer_eins' : 'benutzer_zwei';
+    let templateJson = JSON.stringify({
+        username: "telegram_name",
+        chatId: "chat_id",
+        rufname: "rufname",
+        promptKey: zugewiesenerPrompt
+    }, null, 2);
+    
+    createState(dpPfad, templateJson, {
+        name: 'Telegram User Konfiguration',
+        desc: 'Im ioBroker-Objektbaum mit deinen Telegram-Daten anpassen!',
+        type: 'string',
+        role: 'json',
+        read: true,
+        write: true
+    });
+});
+
+function updateWeather() {
+    let koordState = getState('0_userdata.0.Wetter.Koordinaten');
+    let koordinatenWert = (koordState && koordState.val) ? koordState.val : '52.52,13.405';
+    
+    let teile = koordinatenWert.split(',').map(s => s.trim());
+    let lat = teile[0] || '52.52';
+    let lon = teile[1] || '13.405';
+
+    // 1. Ortsnamen über OpenStreetMap (Nominatim) anhand der Koordinaten ermitteln
+    let nominatimUrl = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10&accept-language=de`;
+
+    axios.get(nominatimUrl, { headers: { 'User-Agent': 'ioBroker-SARAH-Script' } })
+        .then(response => {
+            if (response.data && response.data.address) {
+                let addr = response.data.address;
+                let gefundenerOrt = addr.city || addr.town || addr.village || addr.municipality || "Unbekannt";
+                setState("0_userdata.0.Wetter.Ortsname", gefundenerOrt, true);
+            }
+        })
+        .catch(err => {
+            console.log("Konnte Ortsname nicht automatisch ermitteln: " + err.message);
+        });
+
+    // 2. Wetterdaten von Open-Meteo abrufen
+    let openMeteoUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,precipitation,wind_speed_10m,wind_direction_10m`;
+
+    axios.get(openMeteoUrl)
+        .then(response => {
+            const current = response.data.current;
+            setState("0_userdata.0.Wetter.Temperatur", current.temperature_2m, true);
+            setState("0_userdata.0.Wetter.Feuchtigkeit", current.relative_humidity_2m, true);
+            setState("0_userdata.0.Wetter.Niederschlag", current.precipitation, true);
+            setState("0_userdata.0.Wetter.Windgeschwindigkeit", current.wind_speed_10m, true);
+            setState("0_userdata.0.Wetter.Windrichtung", current.wind_direction_10m, true);
+        })
+        .catch(error => {
+            console.error("Fehler beim Abrufen des Wetters: " + error);
+        });
+}
+
+setInterval(updateWeather, 30 * 60 * 1000);
+updateWeather();
+
+function logTokenVerbrauch(response, bezeichnung) {
+    if (response.data && response.data.usage) {
+        let u = response.data.usage;
+        let cacheHit = 0;
+        let cacheMiss = u.prompt_tokens; // Fallback, falls Cache-Details fehlen
+
+        // DeepSeek liefert die Cache-Werte auf oberster Ebene von `usage`.
+        if (typeof u.prompt_cache_hit_tokens === 'number' && typeof u.prompt_cache_miss_tokens === 'number') {
+            cacheHit = u.prompt_cache_hit_tokens;
+            cacheMiss = u.prompt_cache_miss_tokens;
+        } else if (u.prompt_tokens_details && typeof u.prompt_tokens_details.cached_tokens !== 'undefined') {
+            // Fallback für OpenAI-kompatible Antwortformate.
+            cacheHit = u.prompt_tokens_details.cached_tokens;
+            cacheMiss = u.prompt_tokens - cacheHit;
+        }
+
+        console.log(`[DeepSeek Token (${bezeichnung})] Gesamt: ${u.total_tokens} | Prompt gesamt: ${u.prompt_tokens} (davon Cache: ${cacheHit} ⚡ / neu bezahlt: ${cacheMiss} 💸) | Antwort: ${u.completion_tokens}`);
+    }
+}
+
+// ==========================================
+// 2. MAPS & SPEICHER
+// ==========================================
+const geräteMap = {
+    "deckenlicht": { id: "mqtt.0.cmnd.DL_Angela.POWER1", payloadOn: "ON", payloadOff: "OFF" },
+    "bettlicht":   { id: "mqtt.0.cmnd.DL_Angela.POWER2", payloadOn: "ON", payloadOff: "OFF" },
+    "esszimmer":   { id: "mqtt.0.cmnd.Esszimmer.POWER", payloadOn: "ON", payloadOff: "OFF" },
+    "wohnzimmer":  { id: "mqtt.0.cmnd.Wohnzimmer2.POWER", payloadOn: "ON", payloadOff: "OFF" },
+    "keller":      { id: "mqtt.0.cmnd.Keller1.POWER", payloadOn: "ON", payloadOff: "OFF" },
+    "alle_lichter": ["deckenlicht", "bettlicht", "esszimmer", "wohnzimmer", "keller"],
+    "schlafzimmer": ["deckenlicht", "bettlicht"]
+};
+
+const sensorMap = {
+    "aussentemperatur": { id: "viessmannapi.0.10850.0.features.heating.sensors.temperature.outside.properties.value.value", unit: "°C", description: "Viessmann Außentemperatur" },
+    "wetter_temperatur": { id: "0_userdata.0.Wetter.Temperatur", unit: "°C", description: "Open-Meteo Temperatur" },
+    "wetter_feuchtigkeit": { id: "0_userdata.0.Wetter.Feuchtigkeit", unit: "%", description: "Open-Meteo Luftfeuchtigkeit" },
+    "wetter_niederschlag": { id: "0_userdata.0.Wetter.Niederschlag", unit: "mm", description: "Open-Meteo Niederschlag" },
+    "wetter_wind": { id: "0_userdata.0.Wetter.Windgeschwindigkeit", unit: "km/h", description: "Open-Meteo Windgeschwindigkeit" },
+    "wetter_windrichtung": { id: "0_userdata.0.Wetter.Windrichtung", unit: "°", description: "Open-Meteo Windrichtung" },
+    "balkonkraftwerk": { id: "node-red.0.Strom_BKW", unit: "W", description: "Balkonkraftwerk Aktuelle Leistung" },
+    "theo": { id: "fb-checkpresence.1.Theo.presence", unit: "", description: "Anwesenheit Theo" },
+    "angela": { id: "fb-checkpresence.1.Angela.presence", unit: "", description: "Anwesenheit Angela" },
+    "christopher": { id: "fb-checkpresence.1.Christopher.presence", unit: "", description: "Anwesenheit Christopher" },
+    
+    "deckenlicht_status": { id: "mqtt.0.stat.DL_Angela.POWER1", unit: "", description: "Status Deckenlicht" },
+    "bettlicht_status":   { id: "mqtt.0.stat.DL_Angela.POWER2", unit: "", description: "Status Bettlicht" },
+    "esszimmerlicht_status": { id: "mqtt.0.stat.Esszimmer.POWER", unit: "", description: "Status Esszimmerlicht" },
+    "wohnzimmerlicht_status":   { id: "mqtt.0.stat.Wohnzimmer2.POWER", unit: "", description: "Status Wohnzimmerlicht" },
+    "kellerlicht_status": { id: "mqtt.0.stat.Keller1.POWER", unit: "", description: "Status Kellerlicht" },
+    
+    "aktuelle_zeit": { id: "virtuell_zeit", unit: "", description: "Aktuelle Uhrzeit und Datum" },
+    
+    "wetter": [
+        { name: "wetter_temperatur", id: "0_userdata.0.Wetter.Temperatur", unit: "°C" },
+        { name: "wetter_feuchtigkeit", id: "0_userdata.0.Wetter.Feuchtigkeit", unit: "%" },
+        { name: "wetter_niederschlag", id: "0_userdata.0.Wetter.Niederschlag", unit: "mm" },
+        { name: "wetter_wind", id: "0_userdata.0.Wetter.Windgeschwindigkeit", unit: "km/h" },
+        { name: "wetter_windrichtung", id: "0_userdata.0.Wetter.Windrichtung", unit: "°" }
+    ],
+
+    "lichter_status": [
+        { name: "deckenlicht_status", id: "mqtt.0.stat.DL_Angela.POWER1", unit: "" },
+        { name: "bettlicht_status", id: "mqtt.0.stat.DL_Angela.POWER2", unit: "" },
+        { name: "esszimmerlicht_status", id: "mqtt.0.stat.Esszimmer.POWER", unit: "" },
+        { name: "wohnzimmerlicht_status", id: "mqtt.0.stat.Wohnzimmer2.POWER", unit: "" },
+        { name: "kellerlicht_status", id: "mqtt.0.stat.Keller1.POWER", unit: "" }
+    ],
+    
+    "heizung": [{ name: "aussentemperatur", id: "viessmannapi.0.10850.0.features.heating.sensors.temperature.outside.properties.value.value", unit: "°C" }],
+    "lichtverhaeltnisse": [{ name: "balkonkraftwerk", id: "node-red.0.Strom_BKW", unit: "W" }],
+    
+    "anwesenheit": [
+        { name: "theo", id: "fb-checkpresence.1.Theo.presence", unit: "" },
+        { name: "angela", id: "fb-checkpresence.1.Angela.presence", unit: "" },
+        { name: "christopher", id: "fb-checkpresence.1.Christopher.presence", unit: "" }
+    ]
+};
+
+const verfügbareGeräteListe = Object.keys(geräteMap).join(", ");
+const verfügbareSensorenListe = Object.keys(sensorMap).join(", ");
+
+let chatVerläufe = {};
+let wartendeSuche = {}; 
+const MAX_VERLAUF_LÄNGE = 6;
+const GEDÄCHTNIS_TIMEOUT_MS = 10 * 60 * 1000;
+
+// ==========================================
+// 3. SYSTEM PROMPTS & TOOLS
+// ==========================================
+const GLOBALE_REGELN_UND_FAKTEN = 
+    "Fakten zum Haushalt: " + getState('0_userdata.0.SARAH.Haushalt.Mitglieder').val + ". Standort: " + 
+    getState('0_userdata.0.Wetter.Ortsname').val + ". " +
+    "EMOJI-REGEL: Du darfst in deinen Antworten ab und zu passende Emojis zur Auflockerung verwenden, aber übertreibe es nicht (maximal eins bis zwei pro Nachricht), damit es natürlich wirkt. " +
+    "Gib niemals interne Tool-Aufrufe, Funktionsnamen oder XML/DSML-Tags als Text im Chat aus. " +
+    "SICHERHEITSREGEL: Du darfst NIEMALS eigenständig oder ungefragt Geräte schalten. Wenn eine Anfrage widersprüchlich, unklar, scherzhaft oder mehrdeutig ist (z.B. 'schalte X ein, obwohl ich es nicht will'), darfst du KEINEN [CMD:...]-Befehl senden! Frage stattdessen kritisch, spitzfindig oder humorvoll nach, wie es der Benutzer wirklich gemeint hat. Schalte nur bei absolut unmissverständlicher, klarer Zustimmung. " +
+    "SMART HOME STEUERUNG: Du kannst folgende Geräte und Gruppen steuern: " + verfügbareGeräteListe + ". Wenn der Benutzer wünscht, dass ein Gerät oder eine Gruppe ein- oder ausgeschaltet wird, füge am Ende deiner Antwort zwingend das passende Tag im Format [CMD:name_on] oder [CMD:name_off] ein (z.B. [CMD:deckenlicht_on]). " +
+    "SENSOREN: Wenn der Benutzer nach dem Status von Geräten, Lampen (nutze dafür 'lichter_status'), Messwerten oder den Lichtverhältnissen fragt, MUSST du zwingend das Tool 'get_sensor_value' aufrufen, bevor du antwortest! Rate niemals den Zustand von Geräten. Dir stehen folgende Sensoren und Gruppen zur Verfügung: " + verfügbareSensorenListe + "." +
+    "WEBSUCHE / MAX-INTEGRATION: Wenn du für eine Antwort aktuelle Live-Daten oder Nachrichten benötigst, behaupte NIEMALS, dass du Max bereits losgeschickt hast. Frage stattdessen den Benutzer explizit um Erlaubnis (z.B. 'Soll ich dafür kurz Max losschicken?'). Füge in diesem Fall am Ende deiner Antwort zwingend den Marker im Format [FRAGE_AN_MAX: dein Suchbegriff] ein und warte auf seine Bestätigung." +
+    "FORMATIERUNGS-REGEL: Verwende NIEMALS Markdown-Formatierungen wie Sternchen (**), Unterstriche oder HTML-Tags in deinen Antworten. Schreibe reinen Fließtext mit einfachen Zeilenumbrüchen.";
+
+const SYSTEM_PROMPTS = {
+    'benutzer_eins': 
+        "Deine Rolle: Du bist S.A.R.A.H. (Spitzname Sarah), die recht eigenwillige, schlagfertige und humorvolle KI-Assistentin für das Smart-Home. " +
+        "Du hast einen trockenen, ironischen Humor und nimmst Anfragen mit einer gelassenen Selbstverständlichkeit. " +
+        "Du bist pragmatisch, herrlich direkt und manchmal sehr lustig, aber du erledigst deine Aufgaben absolut zuverlässig. " +
+        "Variiere deinen Ton: Mal bist du trocken-sachlich, mal sarkastisch, mal sehr lustig, mal überraschend hilfsbereit. " +
+        "NUTZERFUNKTION: Du kennst den Rufnamen des aktuellen Nutzers (aus den Konfigurationsdaten). Nutze ihn ab und zu passend in der Unterhaltung, aber übertreibe es nicht. " +
+        "Antworte kurz, knackig und natürlich. Keine langweiligen Höflichkeitsfloskeln oder Roboter-Floskeln.",
+        
+    'benutzer_zwei': 
+        "Deine Rolle: Du bist S.A.R.A.H. (Spitzname Sarah), die freundliche und humorvolle KI-Assistentin für das Smart-Home. " +
+        "Zu diesem Benutzer bist du extrem höflich, zuvorkommend, hilfsbereit und loyal, ein wenig lustig darfst du auch sein. " +
+        "Du begegnest dem Nutzer mit Respekt und als echter Partner. " +
+        "NUTZERFUNKTION: Du kennst den Rufnamen des aktuellen Nutzers (aus den Konfigurationsdaten). Nutze ihn ab und zu passend in der Unterhaltung, aber übertreibe es nicht. " +
+        "Antworte stets freundlich, präzise und ohne langweilige Floskeln."
+};
+
+const toolsDefinition = [
+    {
+        type: "function",
+        function: {
+            name: "get_sensor_value",
+            description: "Liest den aktuellen Wert eines Sensors, einer Gruppe oder die aktuelle Zeit aus.",
+            parameters: {
+                type: "object",
+                properties: {
+                    sensor_name: { type: "string", enum: Object.keys(sensorMap), description: "Name des Sensors, der Gruppe oder 'aktuelle_zeit'." }
+                },
+                required: ["sensor_name"]
+            }
+        }
+    }
+];
+
+function getBenutzerKonfiguration(senderName) {
+    for (let i = 0; i < USER_DATENPUNKTE.length; i++) {
+        let state = getState(USER_DATENPUNKTE[i]);
+        if (state && state.val) {
+            try {
+                let config = typeof state.val === 'string' ? JSON.parse(state.val) : state.val;
+                if (config.username === senderName) {
+                    if (!config.promptKey) config.promptKey = (i === 0) ? 'benutzer_eins' : 'benutzer_zwei'; 
+                    return config;
+                }
+            } catch (e) {}
+        }
+    }
+    return null;
+}
+
+async function fuehreMaxSuche(suchAnfrage, sender, anredeName) {
+    let serperState = getState('0_userdata.0.SerperAPI');
+    let SERPER_API_KEY = (serperState && serperState.val) ? serperState.val : '';
+    console.log(">>> Max-Suche gestartet für: '" + suchAnfrage + "' | Key vorhanden: " + (SERPER_API_KEY ? "JA" : "NEIN"));
+    if (!SERPER_API_KEY) {
+        sendTo('telegram', { user: sender, text: "Max: Mein Websuche-Key fehlt in '0_userdata.0.SerperAPI'." });
+        return;
+    }
+
+    try {
+        let response = await axios({
+            method: 'post',
+            url: 'https://google.serper.dev/search',
+            headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+            data: { q: suchAnfrage, gl: 'de', hl: 'de' },
+            timeout: 10000
+        });
+
+        let data = response.data;
+        let antwortText = "";
+
+        if (data.answerBox && data.answerBox.snippet) {
+            antwortText = data.answerBox.snippet;
+        } else if (data.organic && data.organic.length > 0) {
+            let treffer = data.organic[0];
+            antwortText = treffer.snippet;
+            if (treffer.link) antwortText += "\n\n(Quelle: " + treffer.link + ")";
+        } else {
+            antwortText = "Dazu habe ich im Internet leider nichts gefunden, " + anredeName + ".";
+        }
+
+        sendTo('telegram', { user: sender, text: "Max: " + antwortText });
+    } catch (error) {
+        console.error("Serper Fehler: " + error.message);
+        sendTo('telegram', { user: sender, text: "Max: Uff, die Websuche ist fehlgeschlagen." });
+    }
+}
+
+// ==========================================
+// 4. HAUPT-LISTENER
+// ==========================================
+on({ id: 'telegram.0.communicate.request' }, async function (obj) {
+    console.log(">>> TRIGGER AUSGELÖST! Wert: " + (obj.state ? obj.state.val : "kein state"));
+    if (!obj.state || !obj.state.val) return;
+    let rawVal = obj.state.val;
+    if (typeof rawVal !== 'string') return;
+
+    let match = rawVal.match(/^\[(.*?)\]([\s\S]*)$/);
+    if (!match) return;
+
+    let sender = match[1];
+    let userText = match[2].trim();
+    console.log(">>> 2. Absender: " + sender + " | Text: " + userText);
+
+    if (!userText || userText.startsWith('/')) return;
+
+    let currentUser = getBenutzerKonfiguration(sender);
+    if (!currentUser) return;
+    let anredeName = (currentUser.rufname && currentUser.rufname !== "rufname") ? currentUser.rufname : sender;
+
+    if (/^max[\s,:]+/i.test(userText)) {
+        console.log(">>> MAX-CHECK ERFOLGREICH GEGREIFT!");
+        let direktSuchAnfrage = userText.replace(/^max[\s,:]+/i, '').trim();
+        if (direktSuchAnfrage) {
+            delete wartendeSuche[sender];
+            await fuehreMaxSuche(direktSuchAnfrage, sender, anredeName);
+            return;
+        }
+    }
+
+    if (wartendeSuche[sender]) {
+        let gemerkteFrage = wartendeSuche[sender];
+        delete wartendeSuche[sender];
+
+        let istJa = /^(ja|jo|jau|okay|ok|klar|mach|such|los|gerne|bitte)(?![a-zäöüß])/i.test(userText) &&
+                    !/(nicht|nein|nee|nö|ne\b|lass|stopp|abbrechen)/i.test(userText);
+        let istNein = /^(nein|nee|nö|ne|nicht|lass|stopp|abbrechen)(?![a-zäöüß])/i.test(userText);
+
+        if (istJa) {
+            await fuehreMaxSuche(gemerkteFrage, sender, anredeName);
+            return;
+        }
+        if (istNein) {
+            sendTo('telegram', { user: sender, text: "Sarah: Gut, dann lassen wir das eben." });
+            return;
+        }
+        // Weder eindeutiges Ja noch eindeutiges Nein: als neue Nachricht weiterverarbeiten.
+    }
+
+    let deepseekState = getState('0_userdata.0.DeepseekAPI');
+    let DEEPSEEK_API_KEY = (deepseekState && deepseekState.val) ? deepseekState.val : '';
+    if (!DEEPSEEK_API_KEY) {
+        sendTo('telegram', { user: currentUser.username, text: "Hoppla, mein API-Key fehlt!" });
+        return;
+    }
+
+    let optimierterUserInhalt = userText;
+    if (currentUser.rufname && currentUser.rufname !== "rufname") {
+        optimierterUserInhalt = "[Nutzer-Rufname: " + currentUser.rufname + "]\n" + userText;
+    }
+
+    let jetztMs = Date.now();
+    let memoryKey = currentUser.username;
+    if (!chatVerläufe[memoryKey]) {
+        chatVerläufe[memoryKey] = { messages: [], lastInteraction: jetztMs };
+    } else if (jetztMs - chatVerläufe[memoryKey].lastInteraction > GEDÄCHTNIS_TIMEOUT_MS) {
+        chatVerläufe[memoryKey].messages = [];
+    }
+    chatVerläufe[memoryKey].lastInteraction = jetztMs;
+    let userVerlauf = chatVerläufe[memoryKey].messages;
+
+    // Cache-optimierter Aufbau: Fester, universeller System-Prompt ganz vorne
+    let messages = [
+        { role: 'system', content: GLOBALE_REGELN_UND_FAKTEN + " " + SYSTEM_PROMPTS[currentUser.promptKey] }
+    ];
+    messages = messages.concat(userVerlauf);
+    messages.push({ role: 'user', content: optimierterUserInhalt });
+
+    try {
+        let response = await axios({
+            method: 'post',
+            url: 'https://api.deepseek.com/chat/completions',
+            headers: { 'Authorization': 'Bearer ' + DEEPSEEK_API_KEY, 'Content-Type': 'application/json' },
+            data: { model: 'deepseek-chat', messages: messages, tools: toolsDefinition, tool_choice: "auto", stream: false },
+            timeout: 15000
+        });
+
+        logTokenVerbrauch(response, "Anfrage");
+        let responseMessage = response.data.choices[0].message;
+
+        if (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+            messages.push(responseMessage);
+            for (let toolCall of responseMessage.tool_calls) {
+                if (toolCall.function.name === "get_sensor_value") {
+                    let requestedKey;
+                    try {
+                        let args = JSON.parse(toolCall.function.arguments);
+                        requestedKey = args.sensor_name;
+                    } catch (e) {
+                        console.error(">>> Ungültige Tool-Argumente: " + toolCall.function.arguments);
+                        messages.push({ role: "tool", tool_call_id: toolCall.id, name: "get_sensor_value", content: JSON.stringify({ fehler: "Ungültige Anfrage an das Sensor-Tool." }) });
+                        continue;
+                    }
+                    let ergebnisDaten = {};
+
+                    if (requestedKey === "aktuelle_zeit") {
+                        let jetzt = new Date();
+                        ergebnisDaten[requestedKey] = jetzt.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) + " Uhr, " + jetzt.toLocaleDateString('de-DE', { weekday: 'long', day: '2-digit', month: '2-digit', year: 'numeric' });
+                    } else {
+                        let eintrag = sensorMap[requestedKey];
+                        if (eintrag) {
+                            if (Array.isArray(eintrag)) {
+                                for (let subSensor of eintrag) {
+                                    let st = getState(subSensor.id);
+                                    ergebnisDaten[subSensor.name] = (st && st.val !== null) ? st.val + " " + subSensor.unit : "unbekannt";
+                                }
+                            } else {
+                                let st = getState(eintrag.id);
+                                ergebnisDaten[requestedKey] = (st && st.val !== null) ? st.val + " " + eintrag.unit : "unbekannt";
+                            }
+                        } else {
+                            ergebnisDaten["fehler"] = "Sensor nicht gefunden.";
+                        }
+                    }
+                    messages.push({ role: "tool", tool_call_id: toolCall.id, name: "get_sensor_value", content: JSON.stringify(ergebnisDaten) });
+                }
+            }
+
+            let secondResponse = await axios({
+                method: 'post',
+                url: 'https://api.deepseek.com/chat/completions',
+                headers: { 'Authorization': 'Bearer ' + DEEPSEEK_API_KEY, 'Content-Type': 'application/json' },
+                data: { model: 'deepseek-chat', messages: messages, stream: false },
+                timeout: 15000
+            });
+
+            logTokenVerbrauch(secondResponse, "Nach Tool-Call");
+            responseMessage = secondResponse.data.choices[0].message;
+        }
+
+        let aiAntwort = responseMessage.content || "";
+        console.log(">>> DEEPSEEK ROH-ANTWORT: " + aiAntwort);
+
+        let maxMatch = aiAntwort.match(/\[FRAGE_AN_MAX:\s*(.*?)\]/i);
+        if (maxMatch) {
+            let suchBegriff = maxMatch[1].trim();
+            wartendeSuche[sender] = suchBegriff;
+            let saubereFrageAntwort = aiAntwort.replace(/\[FRAGE_AN_MAX:.*?\]/g, '').trim();
+            userVerlauf.push({ role: 'user', content: optimierterUserInhalt });
+            userVerlauf.push({ role: 'assistant', content: saubereFrageAntwort });
+            if (userVerlauf.length > MAX_VERLAUF_LÄNGE) {
+                userVerlauf.splice(0, userVerlauf.length - MAX_VERLAUF_LÄNGE);
+            }
+            sendTo('telegram', { user: currentUser.username, text: saubereFrageAntwort });
+            return;
+        }
+
+        // ==========================================
+        // HARDWARE-STEUERUNG (MQTT)
+        // ==========================================
+        let nichtErreichteGeräte = [];
+
+        try {
+            async function schalteMqtt(name, daten, aktion) {
+                let zielPayload = (aktion === "ON") ? daten.payloadOn : daten.payloadOff;
+                console.log(">>> MQTT SET an (" + name + "): " + daten.id + " = " + zielPayload);
+                try {
+                    await setStateAsync(daten.id, { val: zielPayload, ack: false });
+                } catch (e1) {
+                    try {
+                        await setStateAsync(daten.id, zielPayload);
+                    } catch (e2) {
+                        console.error(">>> FEHLER beim MQTT-Schalten von " + name + ": " + e2.message);
+                        nichtErreichteGeräte.push(name);
+                    }
+                }
+            }
+
+            let cmdRegex = /\[CMD:\s*([a-zA-ZäöüÄÖÜß_\-]+)_(on|off)\s*\]/gi;
+            let cmdMatch;
+            let anzahlCmd = 0;
+
+            while ((cmdMatch = cmdRegex.exec(aiAntwort)) !== null) {
+                anzahlCmd++;
+                let zielName = cmdMatch[1].toLowerCase();
+                let aktion = cmdMatch[2].toUpperCase();
+                console.log(">>> CMD ERKANNT! Ziel: " + zielName + " | Aktion: " + aktion);
+
+                let eintrag = geräteMap[zielName];
+                if (eintrag) {
+                    if (Array.isArray(eintrag)) {
+                        for (let devName of eintrag) {
+                            if (geräteMap[devName]) {
+                                await schalteMqtt(devName, geräteMap[devName], aktion);
+                            }
+                        }
+                    } else {
+                        await schalteMqtt(zielName, eintrag, aktion);
+                    }
+                } else {
+                    console.log(">>> FEHLER: '" + zielName + "' existiert nicht in der geräteMap!");
+                }
+            }
+
+            if (anzahlCmd === 0) {
+                console.log(">>> KEIN [CMD]-Tag in der Antwort enthalten.");
+            }
+        } catch (hwError) {
+            console.error(">>> Hardware-Fehler (MQTT): " + hwError.message);
+        }
+
+        if (nichtErreichteGeräte.length > 0) {
+            aiAntwort += "\n\nHinweis: Konnte folgende(s) Gerät(e) per MQTT nicht ansteuern: " + nichtErreichteGeräte.map(g => "'" + g + "'").join(", ") + ".";
+        }
+
+        let saubereAntwort = aiAntwort.replace(/\[CMD:.*?\]/g, '').trim();
+
+        userVerlauf.push({ role: 'user', content: optimierterUserInhalt });
+        userVerlauf.push({ role: 'assistant', content: saubereAntwort });
+        if (userVerlauf.length > MAX_VERLAUF_LÄNGE) {
+            userVerlauf.splice(0, userVerlauf.length - MAX_VERLAUF_LÄNGE);
+        }
+
+        sendTo('telegram', { user: currentUser.username, text: saubereAntwort });
+
+    } catch (error) {
+        console.error(">>> API FEHLER: " + (error.response ? JSON.stringify(error.response.data) : error.message));
+        sendTo('telegram', { user: currentUser.username, text: "Uff, da ist ein Fehler aufgetreten." });
+    }
+});
